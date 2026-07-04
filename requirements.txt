@@ -1,0 +1,9 @@
+eventlet==0.30.2
+greenlet==1.1.3
+ryu==4.34
+psutil
+numpy
+pandas
+matplotlib
+scapy
+pytest
