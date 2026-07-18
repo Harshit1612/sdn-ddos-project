@@ -1,4 +1,10 @@
 venv/
+venv38/
 __pycache__/
 *.pyc
-*.log
+.pytest_cache/
+results/*.csv
+results/plots/*.png
+logs/*.log
+data/*.csv
+*.tar.gz
