@@ -8,7 +8,7 @@ import math, csv, os, collections
 from datetime import datetime
 import psutil
 
-POLL_INTERVAL  = 5
+POLL_INTERVAL  = 1
 ENTROPY_THRESH = 2.5
 PKT_THRESH     = 5000
 MIN_FLOWS      = 5
