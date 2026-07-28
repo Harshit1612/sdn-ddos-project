@@ -2,26 +2,21 @@
 """
 controller/ddos_controller.py
 
-Ryu OpenFlow 1.3 controller. Responsibilities:
-  1. L2 learning-switch forwarding (packet_in -> learn MAC -> flow_mod)
-  2. Every POLL_INTERVAL seconds: computes Shannon entropy of source IPs
-     seen via packet_in events since the last window, and logs a metrics
-     row (entropy, detection_flag, cpu_pct, mem_mb, n_flows,
-     detection_latency_ms)
-  3. Controller CPU/memory sampled via psutil every 500ms in a background
-     thread.
-  4. Detection latency: measured as the time from the FIRST polling window
-     in which entropy crosses below ENTROPY_THRESH to the moment the
-     mitigation flow-mod is actually installed.
-  5. Mitigation supports two modes: MITIGATION_MODE = "drop" installs a DROP
-     rule; MITIGATION_MODE = "rate_limit" installs an OpenFlow 1.3 meter.
+Ryu OpenFlow 1.3 controller.
 
-NOTE (fix): source-IP entropy is computed from packet_in events, not from
-flow-table stats matched on ipv4_src. Normal L2 forwarding flows installed
-by this controller only match on eth_dst/eth_src/in_port -- they never have
-an ipv4_src field -- so relying on flow stats meant entropy was never
-computed and no metrics rows were ever written. Counting source IPs
-directly off packet_in fixes this.
+Entropy is computed from FLOW STATS (packet_count), polled every
+POLL_INTERVAL seconds -- not from packet_in events. This matters:
+once a forwarding flow is installed, OpenFlow forwards matching packets
+directly at the switch and the controller stops seeing them via
+packet_in. Flow stats' packet_count keeps accumulating regardless, which
+is why this is the correct signal for a smooth, continuous entropy curve.
+
+Since our L2 forwarding flows only match on eth_src/eth_dst/in_port (no
+IP fields), we learn a mac -> ip mapping from packet_in (whenever we do
+see an IP packet) and use that to attribute each flow's packet_count to
+a source IP. We track a running delta (packets since last poll) per IP
+so entropy reflects *recent* traffic mix, not the whole flow's lifetime
+total.
 
 Run:
     ryu-manager controller/ddos_controller.py
@@ -74,9 +69,14 @@ class DDoSController(app_manager.RyuApp):
         self.mem_samples = collections.deque(maxlen=20)
         self._resource_lock = threading.Lock()
 
-        # --- source-IP tracking for entropy (fix: from packet_in, not flow stats) ---
-        self.src_ip_window = collections.Counter()
-        self._src_ip_lock = threading.Lock()
+        # --- mac <-> ip learning (needed because forwarding flows only
+        # match on L2 fields, so flow stats alone can't tell us the IP) ---
+        self.mac_to_ip = {}
+        self._mac_ip_lock = threading.Lock()
+
+        # --- per (dpid, mac) last-seen cumulative packet_count, so we can
+        # compute a DELTA each poll instead of an ever-growing total ---
+        self.last_packet_count = {}
 
         # --- detection latency tracking ---
         self.entropy_below_thresh_since = None
@@ -129,13 +129,12 @@ class DDoSController(app_manager.RyuApp):
         if eth.ethertype == ether_types.ETH_TYPE_LLDP:
             return
 
-        # --- fix: count source IPs here, since this is the only place we
-        # reliably see every packet's IP header, regardless of what match
-        # fields later get installed in the flow table ---
+        # learn mac -> ip whenever we see an IP packet, so flow-stats
+        # (which only carry L2 match fields) can be attributed to an IP
         ip_pkt = pkt.get_protocol(ipv4.ipv4)
         if ip_pkt:
-            with self._src_ip_lock:
-                self.src_ip_window[ip_pkt.src] += 1
+            with self._mac_ip_lock:
+                self.mac_to_ip[eth.src] = ip_pkt.src
 
         dst, src = eth.dst, eth.src
         dpid = datapath.id
@@ -147,7 +146,7 @@ class DDoSController(app_manager.RyuApp):
 
         if out_port != ofproto.OFPP_FLOOD:
             match = parser.OFPMatch(in_port=in_port, eth_dst=dst, eth_src=src)
-            self.add_flow(datapath, 1, match, actions, idle_timeout=30)
+            self.add_flow(datapath, 1, match, actions, idle_timeout=120)
 
         data = msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
         out = parser.OFPPacketOut(
@@ -173,22 +172,46 @@ class DDoSController(app_manager.RyuApp):
             mem = sum(self.mem_samples) / len(self.mem_samples) if self.mem_samples else 0.0
         return round(cpu, 2), round(mem, 2)
 
-    # ---------------- entropy monitoring loop (fix: packet_in based) ----------------
+    # ---------------- entropy monitoring loop (flow-stats based) ----------------
     def _monitor(self):
         while True:
+            for dp in list(self.datapaths.values()):
+                self._request_stats(dp)
             hub.sleep(POLL_INTERVAL)
-            self._check_entropy()
 
-    def _check_entropy(self):
-        with self._src_ip_lock:
-            counter_snapshot = self.src_ip_window.copy()
-            self.src_ip_window.clear()
+    def _request_stats(self, datapath):
+        parser = datapath.ofproto_parser
+        req = parser.OFPFlowStatsRequest(datapath)
+        datapath.send_msg(req)
 
-        if not counter_snapshot:
-            # no traffic seen this window -- nothing to log yet
-            return
+    @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
+    def flow_stats_reply_handler(self, ev):
+        dpid = ev.msg.datapath.id
+        src_ip_counter = collections.Counter()
 
-        h = self._shannon_entropy(counter_snapshot)
+        with self._mac_ip_lock:
+            mac_to_ip_snapshot = dict(self.mac_to_ip)
+
+        for stat in ev.msg.body:
+            eth_src = stat.match.get("eth_src")
+            if not eth_src:
+                continue  # e.g. the table-miss rule, no eth_src match
+            src_ip = mac_to_ip_snapshot.get(eth_src)
+            if not src_ip:
+                continue  # haven't learned this mac's ip yet
+
+            key = (dpid, eth_src)
+            prev_count = self.last_packet_count.get(key, stat.packet_count)
+            delta = max(0, stat.packet_count - prev_count)
+            self.last_packet_count[key] = stat.packet_count
+
+            if delta > 0:
+                src_ip_counter[src_ip] += delta
+
+        if not src_ip_counter:
+            return  # no new traffic seen this window
+
+        h = self._shannon_entropy(src_ip_counter)
         detection_flag = 1 if h < ENTROPY_THRESH else 0
         cpu_pct, mem_mb = self._current_resource_snapshot()
         latency_ms = None
@@ -197,18 +220,16 @@ class DDoSController(app_manager.RyuApp):
         if detection_flag:
             if self.entropy_below_thresh_since is None:
                 self.entropy_below_thresh_since = now
-            attacker_ip = counter_snapshot.most_common(1)[0][0]
+            attacker_ip = src_ip_counter.most_common(1)[0][0]
             self.logger.info(
                 "ALERT DDoS detected | entropy=%.3f | suspected_src=%s", h, attacker_ip
             )
-            if self.datapaths:
-                dp = next(iter(self.datapaths.values()))
-                self._install_mitigation(dp, attacker_ip)
-                latency_ms = round((time.time() - self.entropy_below_thresh_since) * 1000, 2)
+            self._install_mitigation(ev.msg.datapath, attacker_ip)
+            latency_ms = round((time.time() - self.entropy_below_thresh_since) * 1000, 2)
         else:
             self.entropy_below_thresh_since = None
 
-        self._log_metrics(h, detection_flag, cpu_pct, mem_mb, len(counter_snapshot), latency_ms)
+        self._log_metrics(h, detection_flag, cpu_pct, mem_mb, len(src_ip_counter), latency_ms)
 
     @staticmethod
     def _shannon_entropy(counter):
