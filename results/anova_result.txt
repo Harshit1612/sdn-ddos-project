@@ -1,0 +1,4 @@
+One-way ANOVA on 'detection_rate_pct' across intensity levels
+F-statistic = 101.1006
+p-value = 0.000000
+Significant at alpha=0.05: True

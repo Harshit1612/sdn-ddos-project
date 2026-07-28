@@ -1,161 +1,100 @@
+#!/usr/bin/env python3
+"""
+traffic/traffic_gen.py
+
+Wraps iperf3 (benign baseline, TCP or UDP) and hping3 / a raw UDP flood
+(attack) so a single command runs one experiment configuration end-to-end,
+matching the Phase 5 experiment matrix.
+
+Proposal Step 2 requires benign traffic using "both TCP and UDP streams" --
+--baseline-protocol controls this (default both, matching the proposal).
+
+Must be run with sudo (raw sockets for UDP flood, hping3 needs root).
+
+Run:
+    sudo python3 traffic/traffic_gen.py \\
+        --mode both --type syn \\
+        --baseline-protocol both \\
+        --intensity medium --duration 60 --baseline 10
+"""
 import argparse
-import os
-import sys
+import socket
+import subprocess
 import time
-import csv
 import random
-from datetime import datetime
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from mininet.net import Mininet
-from mininet.node import RemoteController, OVSSwitch
-from mininet.link import TCLink
-from mininet.log import setLogLevel, info
-
-from topology.topo import DataCenterTopo
-
-os.makedirs("results", exist_ok=True)
-
-INTENSITY_MAP = {
-    "low":    {"hping_interval": "u10000", "n_attackers": 1},
-    "medium": {"hping_interval": "u1000",  "n_attackers": 2},
-    "high":   {"hping_interval": None,      "n_attackers": 3},  # None -> --flood
-}
-
-# --- CHANGED: use every host as a potential benign sender, not just h1-h6.
-# With only 6 source hosts, max possible entropy is log2(6) ~= 2.58 bits,
-# which sits right on top of the 2.5 threshold and gives a fragile-looking
-# baseline. With all 12 hosts sending concurrently, max entropy rises to
-# log2(12) ~= 3.58 bits, giving a plot that sits comfortably above threshold
-# like a real benign baseline should.
-BENIGN_ALL_HOSTS = ["h{}".format(i) for i in range(1, 13)]
-
-ATTACK_TARGET     = "h12"
-ATTACK_TARGET_IP  = "10.0.0.12"
-ATTACKER_HOSTS    = ["h1", "h2", "h3"]
+INTENSITY_PPS = {"low": 5000, "medium": 20000, "high": 50000}
+TARGET_IP = "10.0.0.12"
+TARGET_PORT = 80
 
 
-def start_benign_traffic(net, duration, seed=42):
-    info("*** Starting benign iperf3 background traffic (all hosts)\n")
-
-    # every host runs a server, so any host can be a destination
-    for name in BENIGN_ALL_HOSTS:
-        net.get(name).cmd("iperf3 -s -p 5201 -D")
-    time.sleep(1)
-
-    rng = random.Random(seed)
-    flows = []
-    for src_name in BENIGN_ALL_HOSTS:
-        candidates = [h for h in BENIGN_ALL_HOSTS if h != src_name]
-        dst_name = rng.choice(candidates)
-        flows.append((src_name, dst_name))
-
-    for src_name, dst_name in flows:
-        src = net.get(src_name)
-        dst_ip = net.get(dst_name).IP()
-        src.cmd(
-            "iperf3 -c {} -p 5201 -t {} -b 5M > /tmp/{}_iperf.log 2>&1 &".format(
-                dst_ip, duration, src_name
-            )
-        )
-    info("*** Benign traffic started ({} concurrent flows across {} hosts)\n".format(
-        len(flows), len(BENIGN_ALL_HOSTS)))
+def run_baseline(duration, protocol="both"):
+    print(f"[baseline] starting iperf3 benign traffic for {duration}s (protocol={protocol})")
+    procs = []
+    pairs = [(1, 12), (2, 11), (3, 10), (4, 9)]
+    if protocol in ("tcp", "both"):
+        for src, dst in pairs:
+            cmd = ["iperf3", "-c", f"10.0.0.{dst}", "-p", "5201", "-t", str(duration), "-b", "10M"]
+            print("  [TCP]", " ".join(cmd))
+            procs.append(subprocess.Popen(cmd))
+    if protocol in ("udp", "both"):
+        for src, dst in pairs:
+            cmd = ["iperf3", "-c", f"10.0.0.{dst}", "-p", "5202", "-u",
+                   "-t", str(duration), "-b", "5M"]
+            print("  [UDP]", " ".join(cmd))
+            procs.append(subprocess.Popen(cmd))
+    return procs
 
 
-def stop_benign_traffic(net):
-    for name in BENIGN_ALL_HOSTS:
-        net.get(name).cmd("pkill iperf3")
+def run_syn_flood(duration, intensity):
+    pps = INTENSITY_PPS[intensity]
+    print(f"[attack] SYN flood -> {TARGET_IP}:{TARGET_PORT} intensity={intensity} (~{pps} pps) for {duration}s")
+    cmd = ["hping3", "--syn", "--flood", "-p", str(TARGET_PORT), TARGET_IP]
+    print("  ", " ".join(cmd), f" # run for {duration}s then Ctrl+C / pkill hping3")
+    proc = subprocess.Popen(cmd)
+    time.sleep(duration)
+    proc.terminate()
+    return proc
 
 
-def start_attack(net, attack_type, intensity, duration):
-    cfg = INTENSITY_MAP[intensity]
-    n_attackers = cfg["n_attackers"]
-    attackers = ATTACKER_HOSTS[:n_attackers]
-
-    info("*** Starting {} flood ({} intensity) from {} attacker(s) -> {}\n".format(
-        attack_type.upper(), intensity, len(attackers), ATTACK_TARGET_IP))
-
-    flag = "--udp" if attack_type == "udp" else "--syn"
-
-    for name in attackers:
-        h = net.get(name)
-        if cfg["hping_interval"] is None:
-            rate_flag = "--flood"
-        else:
-            rate_flag = "-i {}".format(cfg["hping_interval"])
-        cmd = "timeout {} hping3 {} {} -p 80 {} > /tmp/{}_attack.log 2>&1 &".format(
-            duration, flag, rate_flag, ATTACK_TARGET_IP, name
-        )
-        h.cmd(cmd)
-
-    return attackers
-
-
-def stop_attack(net, attackers):
-    for name in attackers:
-        net.get(name).cmd("pkill hping3")
-
-
-def record_attack_window(attack_type, intensity, start_ts, end_ts):
-    path = "results/attack_windows.csv"
-    write_header = not os.path.exists(path)
-    with open(path, "a", newline="") as f:
-        w = csv.writer(f)
-        if write_header:
-            w.writerow(["attack_type", "intensity", "start_ts", "end_ts"])
-        w.writerow([attack_type, intensity, start_ts, end_ts])
+def run_udp_flood(duration, intensity):
+    pps = INTENSITY_PPS[intensity]
+    print(f"[attack] UDP flood -> {TARGET_IP}:{TARGET_PORT} intensity={intensity} (~{pps} pps) for {duration}s")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    payload = bytes(random.getrandbits(8) for _ in range(512))
+    interval = 1.0 / pps
+    end_time = time.time() + duration
+    sent = 0
+    while time.time() < end_time:
+        sock.sendto(payload, (TARGET_IP, TARGET_PORT))
+        sent += 1
+        time.sleep(interval)
+    sock.close()
+    print(f"[attack] UDP flood finished, sent {sent} packets")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Traffic generator for SDN DDoS testbed")
-    parser.add_argument("--controller", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=6653)
-    parser.add_argument("--mode", choices=["benign", "attack", "both"], default="both")
+    parser = argparse.ArgumentParser(description="Traffic generator: benign baseline + DDoS attacks")
+    parser.add_argument("--mode", choices=["baseline", "attack", "both"], default="both")
     parser.add_argument("--type", choices=["syn", "udp"], default="syn")
+    parser.add_argument("--baseline-protocol", choices=["tcp", "udp", "both"], default="both",
+                         help="benign traffic protocol mix (proposal requires both)")
     parser.add_argument("--intensity", choices=["low", "medium", "high"], default="medium")
-    parser.add_argument("--duration", type=int, default=60, help="attack duration in seconds")
-    parser.add_argument("--baseline", type=int, default=10, help="benign-only warmup seconds before attack")
+    parser.add_argument("--duration", type=int, default=60, help="attack duration (s)")
+    parser.add_argument("--baseline", type=int, default=10, help="baseline warm-up duration (s)")
     args = parser.parse_args()
 
-    setLogLevel("info")
-    topo = DataCenterTopo()
-    net = Mininet(topo=topo, switch=OVSSwitch, controller=None,
-                   autoSetMacs=True, waitConnected=True, link=TCLink)
-    net.addController("c0", controller=RemoteController,
-                       ip=args.controller, port=args.port)
-    net.start()
-    info("*** Waiting for switches to settle\n")
-    time.sleep(3)
-    net.pingAll()
+    if args.mode in ("baseline", "both"):
+        run_baseline(args.baseline, args.baseline_protocol)
+        time.sleep(args.baseline)
 
-    try:
-        if args.mode in ("benign", "both"):
-            total_benign_duration = args.baseline + args.duration if args.mode == "both" else args.duration
-            start_benign_traffic(net, total_benign_duration)
+    if args.mode in ("attack", "both"):
+        if args.type == "syn":
+            run_syn_flood(args.duration, args.intensity)
+        else:
+            run_udp_flood(args.duration, args.intensity)
 
-        if args.mode == "both":
-            info("*** Baseline warmup: {}s of benign-only traffic\n".format(args.baseline))
-            time.sleep(args.baseline)
-
-        if args.mode in ("attack", "both"):
-            attack_start = datetime.now().isoformat()
-            attackers = start_attack(net, args.type, args.intensity, args.duration)
-            info("*** Attack running for {}s\n".format(args.duration))
-            time.sleep(args.duration)
-            stop_attack(net, attackers)
-            attack_end = datetime.now().isoformat()
-            record_attack_window(args.type, args.intensity, attack_start, attack_end)
-            info("*** Attack window recorded: {} -> {}\n".format(attack_start, attack_end))
-
-        if args.mode in ("benign", "both"):
-            info("*** Letting benign flows finish naturally\n")
-            time.sleep(3)
-            stop_benign_traffic(net)
-
-    finally:
-        info("*** Traffic generation complete, tearing down network\n")
-        net.stop()
+    print("Run complete.")
 
 
 if __name__ == "__main__":
