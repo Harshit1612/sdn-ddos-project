@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 detection/entropy_detector.py
+
 Offline entropy-based DDoS detector used to calibrate ENTROPY_THRESH before
 it is hard-coded into controller/ddos_controller.py.
 
@@ -19,18 +20,25 @@ for entropy by testing them on a subset of the CICDDoS2019 dataset"):
 
 Modes:
   --sweep      Threshold sweep (0.5 - 4.5 bits), reports acc/f1/fpr/fnr per
-               threshold and picks the F1-optimal value.
+               threshold, picks the F1-optimal value, and saves a plot
+               (results/plots/fig3_threshold_sweep.png by default).
   (default)    Compute entropy for a single CSV and report alarm/no-alarm.
 
 Run:
     python3 detection/entropy_detector.py --input data/calibration_flows.csv --sweep
     python3 detection/entropy_detector.py --input data/CICDDoS2019_subset.csv --sweep
+    python3 detection/entropy_detector.py --input data/calibration_flows.csv --sweep --window-size 50 --chosen-threshold 2.5 --output results/plots/fig3_threshold_sweep.png
 """
 import argparse
 import collections
 import csv
 import math
+import os
 
+import matplotlib.pyplot as plt
+
+# Column names CICFlowMeter / CICDDoS2019 exports commonly use for the
+# source IP and label fields (varies slightly by export tool/version).
 CIC_SRC_IP_CANDIDATES = ["Source IP", " Source IP", "src_ip", "Src IP"]
 CIC_LABEL_CANDIDATES = ["Label", " Label", "label"]
 CIC_BENIGN_TOKENS = {"benign", "0", "normal"}
@@ -125,19 +133,110 @@ def metrics(TP, FP, TN, FN):
     return acc, prec, rec, f1, fpr, fnr
 
 
-def sweep(rows):
+def plot_sweep(thresholds, accs, f1s, fprs, fnrs, best_thresh, chosen_thresh, output_path):
+    """Renders the accuracy/F1/FPR/FNR-vs-threshold sweep and saves it as a
+    PNG, in the same style as the report's Figure 3."""
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(8.5, 4.5))
+
+    ax.plot(thresholds, accs, marker="o", color="#1F3FBF", label="Accuracy (%)")
+    ax.plot(thresholds, f1s, marker="s", color="#2E8B22", label="F1 Score (%)")
+    ax.plot(thresholds, fprs, marker="^", color="#D62222", label="FPR (%)")
+    ax.plot(thresholds, fnrs, marker="D", color="#B23AC9", label="FNR (%)")
+
+    ax.axvline(best_thresh, color="#E2A73A", linestyle="--",
+               label=f"Best F1 threshold = {best_thresh} bits")
+    if chosen_thresh is not None:
+        ax.axvline(chosen_thresh, color="gray", linestyle=":",
+                   label=f"Chosen operating threshold = {chosen_thresh}")
+
+    ax.set_xlabel("Entropy Threshold (bits)")
+    ax.set_ylabel("Score (%)")
+    ax.set_title("Detection Performance vs Entropy Threshold (window-based sweep)",
+                 fontweight="bold")
+    ax.set_ylim(-5, 105)
+    ax.grid(True, alpha=0.3, linestyle="--")
+    ax.legend(loc="center right", fontsize=8)
+
+    fig.tight_layout()
+    plt.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close()
+    print(f"Saved: {output_path}")
+
+
+def plot_confusion_matrix(TP, FP, TN, FN, thresh, output_path):
+    """Renders a 2x2 confusion matrix (Attack/Benign x Predicted Attack/
+    Predicted Benign) at a single fixed threshold and saves it as a PNG."""
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    # rows = actual class, cols = predicted class
+    matrix = [[TP, FN],
+              [FP, TN]]
+    labels = ["Attack", "Benign"]
+
+    fig, ax = plt.subplots(figsize=(5, 4.5))
+    im = ax.imshow(matrix, cmap="Blues")
+
+    ax.set_xticks([0, 1])
+    ax.set_yticks([0, 1])
+    ax.set_xticklabels([f"Predicted\n{l}" for l in labels])
+    ax.set_yticklabels([f"Actual\n{l}" for l in labels])
+
+    max_val = max(TP, FP, TN, FN) or 1
+    for i in range(2):
+        for j in range(2):
+            val = matrix[i][j]
+            color = "white" if val > max_val * 0.5 else "black"
+            ax.text(j, i, str(val), ha="center", va="center",
+                    color=color, fontsize=16, fontweight="bold")
+
+    ax.set_title(f"Confusion Matrix (threshold = {thresh} bits)", fontweight="bold")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    plt.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close()
+    print(f"Saved: {output_path}")
+
+
+def sweep(rows, window_size=50, chosen_thresh=2.5, output_path="results/plots/fig3_threshold_sweep.png",
+          confusion_output_path="results/plots/fig4_confusion_matrix.png"):
     thresholds = [round(t * 0.25, 2) for t in range(2, 19)]  # 0.5 .. 4.5
+
+    accs, f1s, fprs, fnrs = [], [], [], []
     best = None
+
     for thresh in thresholds:
-        TP, FP, TN, FN = confusion_at_threshold(rows, thresh)
+        TP, FP, TN, FN = confusion_at_threshold(rows, thresh, window_size=window_size)
         acc, prec, rec, f1, fpr, fnr = metrics(TP, FP, TN, FN)
+
         print(f"thresh={thresh:5.2f}  acc={acc*100:6.2f}%  f1={f1*100:6.2f}%  "
-              f"fpr={fpr*100:6.2f}%  fnr={fnr*100:6.2f}%")
+              f"fpr={fpr*100:6.2f}%  fnr={fnr*100:6.2f}%  "
+              f"(TP={TP} FP={FP} TN={TN} FN={FN})")
+
+        accs.append(acc * 100)
+        f1s.append(f1 * 100)
+        fprs.append(fpr * 100)
+        fnrs.append(fnr * 100)
+
         if best is None or f1 > best[1]:
             best = (thresh, f1, fpr, fnr)
+
     print()
     print(f"Best threshold: {best[0]} bits | F1={best[1]*100:.1f}% | "
           f"FPR={best[2]*100:.1f}% | FNR={best[3]*100:.1f}%")
+
+    plot_sweep(thresholds, accs, f1s, fprs, fnrs, best[0], chosen_thresh, output_path)
+
+    # Confusion matrix at the chosen OPERATING threshold (e.g. 2.5, the one
+    # actually hard-coded into the live controller) -- not the best-F1
+    # threshold, since the report should show performance at the threshold
+    # that's actually deployed.
+    TP, FP, TN, FN = confusion_at_threshold(rows, chosen_thresh, window_size=window_size)
+    print(f"\nConfusion matrix @ chosen threshold ({chosen_thresh} bits): "
+          f"TP={TP} FP={FP} TN={TN} FN={FN}")
+    plot_confusion_matrix(TP, FP, TN, FN, chosen_thresh, confusion_output_path)
+
     return best[0]
 
 
@@ -146,6 +245,14 @@ def main():
     parser.add_argument("--input", required=True, help="calibration CSV path (synthetic or real CICDDoS2019)")
     parser.add_argument("--sweep", action="store_true", help="run threshold sweep")
     parser.add_argument("--threshold", type=float, default=2.5, help="single-shot threshold")
+    parser.add_argument("--window-size", type=int, default=50,
+                         help="flows per window for the sweep (default: 50)")
+    parser.add_argument("--chosen-threshold", type=float, default=2.5,
+                         help="operating threshold to mark on the sweep plot (default: 2.5)")
+    parser.add_argument("--output", default="results/plots/fig3_threshold_sweep.png",
+                         help="where to save the sweep plot PNG")
+    parser.add_argument("--confusion-output", default="results/plots/fig4_confusion_matrix.png",
+                         help="where to save the confusion matrix PNG")
     args = parser.parse_args()
 
     rows, source = load_rows(args.input)
@@ -154,7 +261,9 @@ def main():
               "CICDDoS2019 dataset. State this accurately in the report.")
 
     if args.sweep:
-        sweep(rows)
+        sweep(rows, window_size=args.window_size,
+              chosen_thresh=args.chosen_threshold, output_path=args.output,
+              confusion_output_path=args.confusion_output)
     else:
         src_ctr = collections.Counter(r["src_ip"] for r in rows)
         h = shannon_entropy(src_ctr)
