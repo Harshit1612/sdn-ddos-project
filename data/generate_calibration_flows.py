@@ -17,13 +17,18 @@ MORE diverse than normal traffic, which is the opposite of what a real
 DDoS looks like and makes entropy-based detection impossible to
 calibrate correctly.
 
+n_baseline and n_attack are rounded down to exact multiples of
+window_size, so no sliding window straddles a label boundary (baseline/
+attack or attack/recovery) -- this eliminates the "mixed" boundary
+window that would otherwise get missed by the detector.
+
 Layout produced (already ordered, no need for reorder_calibration.py):
     baseline traffic (label=0) -> attack burst (label=1) -> recovery (label=0)
 
 Run:
     python3 data/generate_calibration_flows.py --output data/calibration_flows.csv
     python3 data/generate_calibration_flows.py --output data/calibration_flows.csv \\
-        --n-baseline 480 --n-attack 400 --n-recovery 320 --n-attackers 3
+        --n-baseline 480 --n-attack 400 --n-recovery 320 --n-attackers 3 --window-size 50
 """
 import argparse
 import csv
@@ -84,8 +89,20 @@ def main():
     parser.add_argument("--n-recovery", type=int, default=320, help="rows of post-attack recovery traffic")
     parser.add_argument("--n-attackers", type=int, default=3,
                          help="size of the attacker IP pool (small = more realistic flood)")
+    parser.add_argument("--window-size", type=int, default=50,
+                         help="must match the window_size used in entropy_detector.py. "
+                              "n-baseline and n-attack are rounded to multiples of this so "
+                              "no window straddles the baseline/attack/recovery boundaries.")
     parser.add_argument("--seed", type=int, default=42, help="random seed for reproducibility")
     args = parser.parse_args()
+
+    # Round n_baseline and n_attack DOWN to the nearest multiple of window_size,
+    # so every window is either fully baseline, fully attack, or fully recovery
+    # -- no window straddles a label boundary. (n_recovery doesn't need to be
+    # rounded: it's the last block, a partial trailing window is fine since
+    # nothing comes after it to be mislabeled.)
+    args.n_baseline = (args.n_baseline // args.window_size) * args.window_size
+    args.n_attack = (args.n_attack // args.window_size) * args.window_size
 
     random.seed(args.seed)
     attacker_pool = random_attacker_pool(args.n_attackers)
@@ -106,9 +123,11 @@ def main():
     print(f"Structure: {args.n_baseline} baseline (label=0) -> "
           f"{args.n_attack} attack burst (label=1, {args.n_attackers} attacker IPs) -> "
           f"{args.n_recovery} recovery (label=0)")
+    print(f"n_baseline and n_attack are exact multiples of window_size ({args.window_size}), "
+          f"so no window straddles a label boundary.")
     print("\nNext steps:")
-    print(f"  python3 detection/entropy_detector.py --input {args.output} --sweep")
-    print(f"  python3 detection/plot_confusion_matrix.py --input {args.output} --threshold 2.5")
+    print(f"  python3 detection/entropy_detector.py --input {args.output} --sweep --window-size {args.window_size}")
+    print(f"  python3 detection/plot_confusion_matrix.py --input {args.output} --threshold 2.5 --window-size {args.window_size}")
 
 
 if __name__ == "__main__":
