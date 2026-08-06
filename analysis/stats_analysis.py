@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
 """
 analysis/stats_analysis.py
-
-Runs the one-way ANOVA test required by proposal Section 3.4:
-"Where applicable, a one-way ANOVA test will be conducted to determine if
-there were statistically significant differences between intensities."
-
-This was NOT implemented anywhere in the original build guide -- Figure 12
-(ANOVA box plots) only drew a picture, it never actually ran the test or
-reported an F-statistic / p-value. This module fixes that.
+Runs the one-way ANOVA test required by proposal Section 3.4. Operates on
+results/experiment_summary.csv (per-run metrics), which is independent of
+whether the entropy threshold was calibrated on calibration_flows.csv or
+CICDDoS2019_subset.csv -- no change needed here for that switch.
 
 Run:
-    python3 analysis/stats_analysis.py --summary results/experiment_summary.csv
+  python3 analysis/stats_analysis.py --summary results/experiment_summary.csv
 """
 import argparse
 import csv
@@ -25,21 +21,17 @@ def load_summary(path):
 
 
 def anova_by_intensity(rows, metric_col="detection_rate_pct"):
-    """One-way ANOVA: does attack intensity (low/medium/high) produce a
-    statistically significant difference in the given metric?"""
     groups = defaultdict(list)
     for r in rows:
         groups[r["intensity"]].append(float(r[metric_col]))
 
     intensities = ["low", "medium", "high"]
     samples = [groups[i] for i in intensities if groups.get(i)]
-
     if len(samples) < 2:
         raise ValueError(
             f"Need at least 2 intensity groups with data to run ANOVA, "
             f"found {len(samples)}. Run more experiment configurations first."
         )
-
     f_stat, p_value = stats.f_oneway(*samples)
     return f_stat, p_value, {i: groups[i] for i in intensities if groups.get(i)}
 

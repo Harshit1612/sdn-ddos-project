@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
 tests/test_detection.py
-
 Unit tests for detection/entropy_detector.py, analysis/stats_analysis.py,
-and security/secure_storage.py.
+and security/secure_storage.py. The loader tests already cover BOTH the
+CICDDoS2019 real-export schema (now the default/primary path) and the
+synthetic calibration_flows.csv schema (fallback path) -- no changes
+needed here for the calibration -> CICDDoS2019 switch, since the loader
+was already dataset-agnostic by design.
 
 Run:
-    python3 -m pytest tests/test_detection.py -v
+  python3 -m pytest tests/test_detection.py -v
 """
 import collections
 import csv
@@ -30,21 +33,26 @@ import pytest
 def test_empty_counter_returns_zero():
     assert shannon_entropy(collections.Counter()) == 0.0
 
+
 def test_single_source_zero_entropy():
     c = collections.Counter({"10.0.0.5": 1000})
     assert shannon_entropy(c) == 0.0
+
 
 def test_two_equal_sources_one_bit():
     c = collections.Counter({"10.0.0.1": 500, "10.0.0.2": 500})
     assert math.isclose(shannon_entropy(c), 1.0, rel_tol=1e-6)
 
+
 def test_four_equal_sources_two_bits():
     c = collections.Counter({f"10.0.0.{i}": 250 for i in range(1, 5)})
     assert math.isclose(shannon_entropy(c), 2.0, rel_tol=1e-6)
 
+
 def test_twelve_equal_sources_max_entropy():
     c = collections.Counter({f"10.0.0.{i}": 100 for i in range(1, 13)})
     assert math.isclose(shannon_entropy(c), math.log2(12), rel_tol=1e-6)
+
 
 def test_entropy_is_nonnegative():
     c = collections.Counter({"10.0.0.1": 3, "10.0.0.2": 900, "10.0.0.3": 1})
@@ -56,14 +64,17 @@ def test_heavily_skewed_distribution_low_entropy():
     c = collections.Counter({"192.168.1.1": 9500, "10.0.0.1": 500})
     assert shannon_entropy(c) < 1.0
 
+
 def test_entropy_decreases_as_skew_increases():
     balanced = collections.Counter({"a": 500, "b": 500})
     skewed = collections.Counter({"a": 900, "b": 100})
     assert shannon_entropy(skewed) < shannon_entropy(balanced)
 
+
 def test_single_dominant_source_near_zero():
     c = collections.Counter({"192.168.1.1": 99000, "10.0.0.1": 1000})
     assert shannon_entropy(c) < 0.2
+
 
 def test_entropy_bounded_by_log2_n():
     c = collections.Counter({f"h{i}": 1 for i in range(1, 13)})
@@ -80,33 +91,40 @@ def sample_rows():
         rows.append({"src_ip": "192.168.1.1", "label": "1"})
     return rows
 
+
 def test_confusion_counts_sum_to_total(sample_rows):
     TP, FP, TN, FN = confusion_at_threshold(sample_rows, 2.5)
-    expected_windows = -(-len(sample_rows) // 50)  # ceil division, window_size=50
+    expected_windows = -(-len(sample_rows) // 50)
     assert TP + FP + TN + FN == expected_windows
+
 
 def test_low_threshold_produces_no_alarms(sample_rows):
     TP, FP, TN, FN = confusion_at_threshold(sample_rows, 0.0)
     assert TP == 0 and FP == 0
 
+
 def test_high_threshold_produces_all_alarms(sample_rows):
     TP, FP, TN, FN = confusion_at_threshold(sample_rows, 10.0)
     assert TN == 0 and FN == 0
+
 
 def test_metrics_accuracy_between_zero_and_one(sample_rows):
     TP, FP, TN, FN = confusion_at_threshold(sample_rows, 2.5)
     acc, prec, rec, f1, fpr, fnr = metrics(TP, FP, TN, FN)
     assert 0.0 <= acc <= 1.0
 
+
 def test_metrics_f1_between_zero_and_one(sample_rows):
     TP, FP, TN, FN = confusion_at_threshold(sample_rows, 2.5)
     acc, prec, rec, f1, fpr, fnr = metrics(TP, FP, TN, FN)
     assert 0.0 <= f1 <= 1.0
 
+
 def test_metrics_fnr_between_zero_and_one(sample_rows):
     TP, FP, TN, FN = confusion_at_threshold(sample_rows, 2.5)
     acc, prec, rec, f1, fpr, fnr = metrics(TP, FP, TN, FN)
     assert 0.0 <= fnr <= 1.0
+
 
 def test_metrics_all_zero_when_no_data():
     acc, prec, rec, f1, fpr, fnr = metrics(0, 0, 0, 0)
@@ -124,6 +142,7 @@ def test_entropy_known_values(counts, expected_bits):
     c = collections.Counter(counts)
     assert math.isclose(shannon_entropy(c), expected_bits, rel_tol=1e-6)
 
+
 @pytest.mark.parametrize("thresh", [0.5, 1.0, 1.5, 2.0, 2.5, 3.0])
 def test_threshold_sweep_range_valid(thresh):
     rows = [{"src_ip": "10.0.0.1", "label": "0"}] * 800 + \
@@ -136,11 +155,12 @@ def test_threshold_sweep_range_valid(thresh):
 def test_calibrated_threshold_within_expected_report_range():
     assert 2.0 <= 2.5 <= 4.0
 
+
 def test_max_entropy_for_twelve_hosts_matches_report():
     assert math.isclose(math.log2(12), 3.5849625007211562, rel_tol=1e-9)
 
 
-# ---------- CICDDoS2019 loader (3 tests) ----------
+# ---------- CICDDoS2019 / synthetic loader (3 tests) ----------
 def test_load_rows_synthetic_schema():
     with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, newline="") as f:
         w = csv.DictWriter(f, fieldnames=["src_ip", "label"])
@@ -152,6 +172,7 @@ def test_load_rows_synthetic_schema():
     assert source == "synthetic"
     assert rows[0]["src_ip"] == "10.0.0.1"
 
+
 def test_load_rows_cicddos2019_schema():
     with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, newline="") as f:
         w = csv.DictWriter(f, fieldnames=["Source IP", "Label"])
@@ -162,8 +183,9 @@ def test_load_rows_cicddos2019_schema():
     rows, source = load_rows(path)
     os.remove(path)
     assert source == "cicddos2019"
-    assert rows[0]["label"] == "0"   # BENIGN -> 0
-    assert rows[1]["label"] == "1"   # attack label -> 1
+    assert rows[0]["label"] == "0"
+    assert rows[1]["label"] == "1"
+
 
 def test_load_rows_unrecognised_schema_raises():
     with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, newline="") as f:
@@ -186,6 +208,7 @@ def test_anova_detects_significant_difference():
     assert p_value < 0.05
     assert f_stat > 0
 
+
 def test_anova_raises_on_insufficient_groups():
     rows = [{"intensity": "low", "detection_rate_pct": 90}]
     with pytest.raises(ValueError):
@@ -197,25 +220,21 @@ def test_encrypt_decrypt_roundtrip(tmp_path):
     key_path = tmp_path / "key.bin"
     generate_key(str(key_path))
     key = open(key_path, "rb").read()
-
     data_path = tmp_path / "data.csv"
     data_path.write_text("a,b\n1,2\n")
-
     encrypt_file(str(data_path), key, delete_plaintext=True)
     assert not data_path.exists()
     assert (tmp_path / "data.csv.enc").exists()
-
     decrypt_file(str(tmp_path / "data.csv.enc"), key, out_path=str(data_path))
     assert data_path.read_text() == "a,b\n1,2\n"
+
 
 def test_encrypted_file_is_not_plaintext(tmp_path):
     key_path = tmp_path / "key.bin"
     generate_key(str(key_path))
     key = open(key_path, "rb").read()
-
     data_path = tmp_path / "secret.csv"
     data_path.write_text("attacker_ip,192.168.1.11\n")
-
     encrypt_file(str(data_path), key, delete_plaintext=True)
     enc_bytes = (tmp_path / "secret.csv.enc").read_bytes()
     assert b"192.168.1.11" not in enc_bytes

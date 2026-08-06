@@ -35,7 +35,7 @@ def main():
     data = [groups[i] for i in intensities]
 
     plt.figure(figsize=(8, 6))
-    box = plt.boxplot(data, labels=[i.capitalize() for i in intensities],
+    box = plt.boxplot(data, tick_labels=[i.capitalize() for i in intensities],
                        patch_artist=True)
     colors = ["#a6cee3", "#1f78b4", "#08306b"]
     for patch, color in zip(box["boxes"], colors):
